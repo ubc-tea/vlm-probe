@@ -1,4 +1,4 @@
-"""Audited, weight-free consumed-attention taps for Transformers 5.3 decoders.
+"""Audited consumed-attention taps for Transformers 5.3 and Gemma 4 in 5.5.4.
 
 The numerical operations and their order match ``eager_attention_forward``.
 The backend override lasts only for an attention call: decoder mask construction
@@ -25,6 +25,7 @@ _AUDITED_CLASSES = {
         ("qwen2_5_vl", "Qwen2_5_VLAttention"),
         ("qwen3_vl", "Qwen3VLTextAttention"),
         ("qwen3_5", "Qwen3_5Attention"),
+        ("gemma4", "Gemma4TextAttention"),
     )
 }
 _SUPPORT_ONLY_CLASSES = {
@@ -120,6 +121,9 @@ def install_eager_taps(attention):
         return True
     native = import_module(type(attention).__module__)
     functions, repeat_kv = native.ALL_ATTENTION_FUNCTIONS, native.repeat_kv
+    # Gemma's native eager kernel supports attention soft-capping. Other audited
+    # kernels may accept the same keyword through **kwargs without using it.
+    supports_softcap = "softcap" in signature(native.eager_attention_forward).parameters
 
     def tapped_eager(module, query, key, value, attention_mask, scaling, dropout=0., **kwargs):
         _emit_support(module, attention_mask, batch=query.shape[0], heads=query.shape[1],
@@ -127,6 +131,12 @@ def install_eager_taps(attention):
         key = repeat_kv(key, module.num_key_value_groups)
         value = repeat_kv(value, module.num_key_value_groups)
         scores = torch.matmul(query, key.transpose(2, 3)) * scaling
+        softcap = kwargs.get("softcap") if supports_softcap else None
+        if softcap is not None:
+            # Match native operation order and dtype before adding its mask.
+            scores = scores / softcap
+            scores = torch.tanh(scores)
+            scores = scores * softcap
         if attention_mask is not None:
             scores = scores + attention_mask
         scores = module._probe_scores(scores)
@@ -136,7 +146,9 @@ def install_eager_taps(attention):
         output = torch.matmul(weights, value).transpose(1, 2).contiguous()
         return output, weights
 
-    backend = "vlm_probing_consumed_eager"
+    # The registry is shared across model families. Keep each native kernel's
+    # captured helpers/capabilities independent of later adapter installations.
+    backend = f"vlm_probing_consumed_eager:{native.__name__}"
     functions.register(backend, tapped_eager)
     attention.add_module("_probe_scores", nn.Identity())
     attention.add_module("_probe_probs", nn.Identity())

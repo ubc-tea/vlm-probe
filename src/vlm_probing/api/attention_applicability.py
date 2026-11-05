@@ -24,8 +24,20 @@ def propagation_applicability(spec, method):
     """
     if method not in _PROPAGATION:
         return None
-    causal = spec.causal_attention
-    if causal is True:
+    pattern = spec.attention_pattern
+    if pattern is None:
+        pattern = ("unspecified" if spec.causal_attention is None else
+                   "causal" if spec.causal_attention else "bidirectional")
+    causal = {"causal": True, "bidirectional": False}.get(pattern)
+    if pattern == "mixed":
+        caveat = (
+            "The adapter declares mixed causal and bidirectional attention, such as "
+            "causal text with bidirectional visual blocks. Inspect the captured "
+            "structural support for the selected layers and positions. Causal routes "
+            "can favor early sequence positions. These maps do not establish spatial "
+            "faithfulness or causal influence. The propagation formula is unchanged."
+        )
+    elif causal is True:
         caveat = _CAUSAL_CAVEAT
         warnings.warn(f"{method}: {caveat}", CausalAttentionWarning, stacklevel=3)
     elif causal is False:
@@ -36,7 +48,12 @@ def propagation_applicability(spec, method):
         caveat = ("The adapter has not declared causal_attention; attention-mask "
                   "applicability is unknown. Inspect the model's actual masks "
                   "before interpreting propagation maps.")
-    return {"causal_attention": causal,
-            "attention_pattern": "unspecified" if causal is None else "causal" if causal else "bidirectional",
-            "propagation_formula_modified": False,
-            "caveat": caveat}
+    result = {"causal_attention": causal,
+              "attention_pattern": pattern,
+              "propagation_formula_modified": False,
+              "caveat": caveat}
+    if spec.last_stream_kv_layer is not None:
+        result["propagation_limit"] = spec.last_stream_kv_layer
+        result["caveat"] = (f"{caveat} Propagation stops at layer {spec.last_stream_kv_layer} "
+                            "because later layers reuse stored K/V.")
+    return result
