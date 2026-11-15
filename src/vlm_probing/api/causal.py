@@ -2,6 +2,7 @@
 import torch
 
 from .. import causal as kernels
+from ..causal.base import scalar_metric
 from ..adapters import CapabilityError, ProbeInputs, TokenLayout
 from ..core import ProbeResult
 from ..core.precision import analysis_difference, analysis_dtype
@@ -49,6 +50,7 @@ class CausalProbe(BoundMethod):
             other_layout = p._layout(other, source_trace.logits)
             check_alignment(p, other, inputs, other_layout, layout, alignment)
         token_mask = layout.select(self.tokens) if name != "knockout" else None
+        gradients = None
         results = []
         for layer, site in zip(self.layers, sites):
             original = trace.activations[site]
@@ -57,15 +59,24 @@ class CausalProbe(BoundMethod):
             mask = token_mask.to(original.device)[..., None] if token_mask is not None else None
             src = source_trace.activations[site] if source_trace is not None else None
             if name == "attribute":
-                def metric_hidden(value):
-                    output = p._run(inputs, interventions={site: lambda _: value}, grad=True)
-                    scores = evaluate(metric, output.logits, layout)
-                    return scores.to(analysis_dtype(scores)).sum()
-                result = kernels.AttributionPatching().run(original, src, mask=mask, metric=metric_hidden)
+                if "steps" in o:
+                    def metric_hidden(value, site=site):
+                        output = p._run(inputs, interventions={site: lambda _: value}, grad=True)
+                        scores = evaluate(metric, output.logits, layout)
+                        return scores.to(analysis_dtype(scores)).sum()
+                    result = kernels.AttributionPatching().run(original, src, mask=mask,
+                                                               metric=metric_hidden, steps=o["steps"])
+                    keep = ("estimated_effect", "effect", "completeness_error")
+                else:
+                    if gradients is None:
+                        gradients = self._residual_gradients(inputs, sites, trace, metric, layout)
+                    result = kernels.AttributionPatching().run(original, src, mask=mask,
+                                                               gradient=gradients[site])
+                    keep = ("estimated_effect",)
                 # Retain useful scores, not full cached activations/gradients.
                 results.append(ProbeResult(result.method, {
                     "token_scores": result.tensors["attribution"].sum(-1),
-                    "estimated_effect": result.tensors["estimated_effect"],
+                    **{key: result.tensors[key] for key in keep},
                 }, result.metadata))
                 continue
             if name == "patch":
@@ -96,6 +107,25 @@ class CausalProbe(BoundMethod):
                     metric=metric_metadata(metric),
                     effect_sign="source/intervention minus receiver",
                     applicability=self.applicability)
+
+    def _residual_gradients(self, inputs, sites, trace, metric, layout):
+        """Metric gradients at every selected residual from one forward and one backward.
+
+        A zero offset added at each site leaves the forward values unchanged. The
+        gradient with respect to the offset at layer l is the total derivative at
+        residual l, with all later computation live: the quantity a separate
+        replay from that layer would differentiate.
+        """
+        p = self.probe
+        offsets = {site: torch.zeros_like(trace.activations[site], requires_grad=True) for site in sites}
+        edits = {site: (lambda hidden, offset=offset: hidden + offset) for site, offset in offsets.items()}
+        with torch.enable_grad():
+            output = p._run(inputs, interventions=edits, grad=True)
+            scores = evaluate(metric, output.logits, layout)
+            # Same finite/differentiable checks as the per-layer kernel path.
+            total = scalar_metric(lambda _: scores.to(analysis_dtype(scores)).sum(), None)
+            grads = torch.autograd.grad(total, list(offsets.values()))
+        return dict(zip(offsets, grads))
 
     def forward(self, inputs, *, direction=None, capture=()):
         """One live joint forward, optionally retaining requested hook tensors.
@@ -346,8 +376,12 @@ class CausalMethods:
         """Joint sender-to-receiver intervention; Q/K/V heads are physical axes."""
         return PathProbe(self.probe, senders, receivers, sender_tokens, donor_tokens, receiver_tokens)
 
-    def attribute(self, *, layers=None, tokens="visual"):
-        return CausalProbe(self.probe, "attribute", layers_for(self.probe, layers), tokens)
+    def attribute(self, *, layers=None, tokens="visual", steps=None):
+        """First-order attribution patching, or path-integrated with ``steps`` intervals."""
+        if steps is not None and (not isinstance(steps, int) or isinstance(steps, bool) or steps < 1):
+            raise ValueError("steps must be None or a positive integer")
+        options = {} if steps is None else {"steps": steps}
+        return CausalProbe(self.probe, "attribute", layers_for(self.probe, layers), tokens, **options)
 
     def steer(self, *, layers=None, tokens="visual", strength=1., preserve_norm=False, joint=False):
         return CausalProbe(self.probe, "steer", layers_for(self.probe, layers), tokens,
