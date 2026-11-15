@@ -9,7 +9,7 @@ Estimate a residual replacement effect from the receiver gradient and the source
 `probe` is a `Prober` bound to a loaded model; `inputs` contains prepared model inputs. The blocks below are API signatures: `*` marks keyword-only parameters, not an argument to copy. The [complete example](#complete-example-input-to-output) defines the model, inputs, and all other variables before running the method.
 
 ```text
-method = probe.causal.attribute(*, layers=None, tokens="visual")
+method = probe.causal.attribute(*, layers=None, tokens="visual", steps=None)
 result = method.run(inputs, *, source, metric, alignment="strict")
 ```
 
@@ -17,6 +17,7 @@ result = method.run(inputs, *, source, metric, alignment="strict")
 | --- | --- | --- |
 | `layers` | `None` | All available residual layers; pass one integer or a nonempty list of unique available layer IDs. Check `probe.describe()`. |
 | `tokens` | `"visual"` | Positions to replace/attribute. Use expanded token selectors described below. |
+| `steps` | `None` | `None` gives the first-order estimate (gradient at the receiver only). A positive integer averages the gradient along the straight path from the receiver to the replacement with a trapezoidal rule over `steps` intervals (`steps + 1` gradients) and also measures the replacement; see [Path integration](#path-integration). |
 | `inputs` | required | Receiver/base input: native model keyword dictionary or `ProbeInputs`. Full sequence, no KV cache. |
 | `source` | required | Aligned donor input providing replacement residuals. It need not be the clean condition; define the intervention direction explicitly. |
 | `metric` | required | Output score to compare. See metric contract below. |
@@ -31,6 +32,14 @@ A metric is a `TokenMargin`, `SequenceLogProb`, or a callable `metric(logits)` r
 For selected residual `h` and source `h_source`, differentiate the batch-summed metric with respect to the receiver residual and compute `(h_source - h) * gradient`. Sum hidden dimensions for `token_scores[L,B,T]`, then selected batch/token positions for `estimated_effect[L]`. Masked positions have zero score. The difference, products and sums use at least FP32 for FP16/BF16 residuals and preserve FP64; the gradient itself is taken in the model's native dtype. The estimate is **batch-summed**; compare against `exact.effect.sum(-1)` for a batched exact experiment, rather than one arbitrary batch row.
 
 All selected layers share one gradient-enabled receiver forward and one backward. A zero offset added at each selected residual leaves the forward values unchanged; the gradient with respect to that offset is the total derivative at that residual with all later computation live, which is what a separate replay from each layer would compute. A sweep therefore costs three forwards and one backward regardless of the number of layers, with peak memory set by the earliest selected layer, as for a replay from that layer.
+
+### Path integration
+
+The first-order estimate uses the gradient only at the receiver. When the metric is nonlinear along the replacement (for example nearly flat for small partial replacements and changing sharply later), or when the replacement is large, that gradient can predict the wrong magnitude and sign. With `steps=m`, each layer instead uses the residual path `h + a (h_source - h)` restricted to the selected positions, with `a = 0, 1/m, ..., 1`. Path points are formed in at least FP32 and replayed in the model's dtype; the end point is the selected replacement itself, not a reconstruction. `token_scores` and `estimated_effect` then use the trapezoidal average of the `m + 1` gradients.
+
+The two path endpoints are actual replays, so a path result also contains `effect[L]`, the measured effect of the same single-layer replacement (equal to `causal.patch(...).run(...).tensors["effect"].sum(-1)`), and `completeness_error[L] = estimated_effect - effect`. A small completeness error relative to `effect` indicates that the quadrature has converged for the total; it does not validate individual token scores. Increase `steps` until it is small for the layers you report.
+
+Cost: first-order attribution shares one backward across all layers (above); path integration replays each selected layer `steps + 1` times with gradients, so a sweep costs about `len(layers) * (steps + 1)` forward-backward passes. Compare [EAP-IG](eap_ig.md), which integrates edge messages rather than residual replacements.
 
 The source forward provides the activation difference; the receiver replay requires gradients. Do not wrap this call in `torch.no_grad()` or inference mode. Frozen model weights are allowed: the method differentiates retained activations without training model parameters. Large changes and nonlinear interactions can make the estimate differ in magnitude or sign from actual replacements.
 
