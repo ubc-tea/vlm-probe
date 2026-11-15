@@ -4,7 +4,7 @@ import torch
 from torch import Tensor
 
 from ..core.types import ProbeResult
-from .base import BaseCausal, Runner, scalar_metric, selection_mask, validate_pair
+from .base import BaseCausal, Runner, scalar_metric, selection_mask, validate_activation, validate_pair
 
 
 class AttributionPatching(BaseCausal):
@@ -34,6 +34,7 @@ class AttributionPatching(BaseCausal):
             with torch.enable_grad():
                 point = receiver.detach().clone().requires_grad_(True)
                 gradient = torch.autograd.grad(scalar_metric(metric, point), point)[0]
+        validate_activation(gradient, "gradient")
         validate_pair(receiver, gradient)
         selected = selection_mask(receiver, mask)
         # Difference, products and their sum use at least FP32 (FP64 is
